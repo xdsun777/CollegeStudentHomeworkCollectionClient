@@ -145,7 +145,7 @@ class App:
         ttk.Label(self.func_frame, text="选择功能:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
         self.func_var = tk.StringVar()
         func_combo = ttk.Combobox(self.func_frame, textvariable=self.func_var, values=[
-            "全量同步", "打包作业", "生成报告", "创建作业文件夹", "删除作业文件夹"
+            "全量同步", "同步学科/作业", "打包作业", "生成报告", "创建作业文件夹", "删除作业文件夹"
         ], state="readonly")
         func_combo.grid(row=0, column=1, padx=5, pady=5)
         func_combo.bind("<<ComboboxSelected>>", self.on_func_selected)
@@ -245,6 +245,24 @@ class App:
             ttk.Button(self.param_frame, text="刷新作业", command=self.refresh_assignments).grid(row=1, column=2, padx=5, pady=5)
 
             # 初始加载
+            self.refresh_courses()
+        elif func == "同步学科/作业":
+            # 学科下拉（必选）
+            ttk.Label(self.param_frame, text="学科:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
+            self.course_combo = ttk.Combobox(self.param_frame, width=30, state="readonly")
+            self.course_combo.grid(row=0, column=1, padx=5, pady=5)
+            self.course_combo.bind("<<ComboboxSelected>>", self.on_course_selected)
+            ttk.Button(self.param_frame, text="刷新学科", command=self.refresh_courses).grid(row=0, column=2, padx=5, pady=5)
+
+            # 作业下拉（可选）
+            ttk.Label(self.param_frame, text="作业（可选）:").grid(row=1, column=0, sticky=tk.W, padx=5, pady=5)
+            self.assignment_combo = ttk.Combobox(self.param_frame, width=30, state="readonly")
+            self.assignment_combo.grid(row=1, column=1, padx=5, pady=5)
+            ttk.Button(self.param_frame, text="刷新作业", command=self.refresh_assignments).grid(row=1, column=2, padx=5, pady=5)
+            ttk.Label(self.param_frame, text="提示: 作业可选，留空则同步该学科下所有作业", foreground="gray").grid(row=2, column=0, columnspan=3, sticky=tk.W, padx=5, pady=2)
+
+            ttk.Checkbutton(self.param_frame, text="强制覆盖已存在文件", variable=self.force_var).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=5, pady=5)
+
             self.refresh_courses()
 
     # ---------- 网盘数据获取 ----------
@@ -473,7 +491,14 @@ class App:
                     return
                 # 删除功能内部有确认
                 main.delete_assignment(course, assignment, yes=False)
-
+            elif func == "同步学科/作业":
+                course = self.course_combo.get().strip()
+                if not course:
+                    self.show_error("学科不能为空")
+                    return
+                assignment = self.assignment_combo.get().strip() if self.assignment_combo else None
+                force = self.force_var.get()
+                main.sync_assignment(course, assignment, force)
             else:
                 self.show_error("未知功能")
         except Exception as e:

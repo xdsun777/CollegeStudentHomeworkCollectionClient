@@ -3,37 +3,10 @@
 网盘作业管理工具
 功能：
 1. 全量同步网盘所有文件到本地 WORKDIR
-2. 指定科目和作业，将本地所有学生的该作业打包为 ZIP（若本地缺失则先从网盘下载）
-3. 生成每位学生各科目各作业完成情况的 Excel 报告（按科目分工作表，完成标记为√）
-4. 为所有学生在指定科目下创建作业文件夹（远程）
-5. 删除所有学生在指定科目下的作业文件夹（远程）
-
-环境变量（.env）：
-    WORKDIR         本地工作目录
-    BASE_URL        网盘根URL
-    USER            认证用户名
-    PASSWD          认证密码
-
-使用方法：
-    1. 全量同步（从网盘下载）
-        python main.py sync [--force]
-
-    2. 打包指定作业
-        python main.py pack -c 科目名 -a 作业名 -t 输出.zip [--force]
-
-    3. 生成统计报告
-        python main.py report -r 报告.xlsx
-
-    4. 为所有学生创建作业文件夹
-        python main.py new -c 科目名 -a 作业名
-
-    5. 删除所有学生的指定作业文件夹
-        python main.py delete -c 科目名 -a 作业名 [--yes]
-
-    兼容旧版（无子命令）：
-        python main.py                     # 全量同步
-        python main.py -c 科目 -a 作业 -t 输出.zip  # 打包
-        python main.py --report 报告.xlsx          # 报告
+2. 同步指定学科或学科下指定作业（每个学生）
+3. 打包指定作业
+4. 生成报告
+5. 创建/删除作业文件夹
 """
 
 import os
@@ -46,35 +19,23 @@ from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
 
-# 加载 .env
 load_dotenv()
 
-# 配置常量
 WORKDIR = Path(os.getenv('WORKDIR', ''))
 BASE_URL = os.getenv('BASE_URL', '').rstrip('/')
 USER = os.getenv('USER', '')
 PASSWD = os.getenv('PASSWD', '')
 
-# 请求会话（复用连接）
 session = requests.Session()
 session.auth = (USER, PASSWD)
 
 def ensure_dir(path: Path):
-    """确保目录存在"""
     path.mkdir(parents=True, exist_ok=True)
 
 def is_student_dir(name: str) -> bool:
-    """
-    判断目录名是否符合学生文件夹格式：{学号}-{姓名}
-    学号：数字；姓名：中文字符或字母
-    """
     return bool(re.match(r'^\d+-\w+$', name))
 
 def list_remote_dir(remote_path: str):
-    """
-    获取远程目录下的条目列表（非递归）
-    返回: [{'name': 'xxx', 'type': 'dir'/'file', 'size': int}]
-    """
     url = f"{BASE_URL}/{remote_path}".rstrip('/') + '/?json'
     try:
         resp = session.get(url, timeout=10)
@@ -94,14 +55,12 @@ def list_remote_dir(remote_path: str):
         return []
 
 def create_remote_dir(remote_path: str):
-    """创建远程目录（MKCOL）"""
     url = f"{BASE_URL}/{remote_path}"
     try:
         resp = session.request('MKCOL', url, timeout=10)
         if resp.status_code in (200, 201):
             return True
         elif resp.status_code == 409:
-            # 目录已存在
             return False
         else:
             print(f"  创建目录失败 {remote_path}: {resp.status_code}")
@@ -111,14 +70,12 @@ def create_remote_dir(remote_path: str):
         return False
 
 def delete_remote(remote_path: str):
-    """删除远程文件或目录"""
     url = f"{BASE_URL}/{remote_path}"
     try:
         resp = session.delete(url, timeout=10)
         if resp.status_code in (200, 204):
             return True
         elif resp.status_code == 404:
-            # 不存在视为已删除
             return False
         else:
             print(f"  删除失败 {remote_path}: {resp.status_code}")
@@ -128,9 +85,6 @@ def delete_remote(remote_path: str):
         return False
 
 def download_file(remote_path: str, local_path: Path, force=False):
-    """
-    下载单个文件到本地，如果本地文件已存在且大小相同则跳过
-    """
     if not force and local_path.exists():
         try:
             head = session.head(f"{BASE_URL}/{remote_path}", timeout=5)
@@ -155,9 +109,6 @@ def download_file(remote_path: str, local_path: Path, force=False):
         print(f"  下载失败 {remote_path}: {e}")
 
 def download_zip(remote_dir: str, local_dir: Path, force=False):
-    """
-    下载远程目录的 zip 并解压到本地
-    """
     if not force and local_dir.exists() and any(local_dir.iterdir()):
         print(f"  本地目录已存在且非空，跳过：{local_dir}")
         return
@@ -199,7 +150,6 @@ def download_zip(remote_dir: str, local_dir: Path, force=False):
         print(f"  下载失败 {remote_dir}: {e}")
 
 def sync_all(force=False):
-    """全量同步网盘所有内容到本地 WORKDIR"""
     if not WORKDIR:
         print("错误：未设置 WORKDIR 环境变量，无法执行全量同步。")
         return
@@ -223,10 +173,63 @@ def sync_all(force=False):
     _sync_recursive('', WORKDIR)
     print("全量同步完成。")
 
+# ========== 新增：同步学科/作业 ==========
+def sync_assignment(course: str, assignment: str = None, force=False):
+    """
+    为每个学生同步指定学科下的所有作业（或指定作业）
+    course: 学科名称
+    assignment: 作业名称，如果为 None 则同步该学科下所有作业
+    force: 强制覆盖
+    """
+    if not WORKDIR:
+        print("错误：未设置 WORKDIR 环境变量。")
+        return
+
+    # 获取所有学生
+    try:
+        local_students = [d.name for d in WORKDIR.iterdir() if d.is_dir() and is_student_dir(d.name)]
+    except Exception as e:
+        print(f"无法读取本地学生目录：{e}")
+        local_students = []
+
+    if not local_students:
+        print("本地 WORKDIR 中未找到学生文件夹，将尝试从网盘获取学生列表。")
+        remote_root = list_remote_dir('')
+        remote_students = [e['name'] for e in remote_root if e['type'] == 'directory' and is_student_dir(e['name'])]
+        if not remote_students:
+            print("网盘根目录下也没有找到学生文件夹。")
+            return
+        students = remote_students
+    else:
+        students = local_students
+
+    print(f"共 {len(students)} 个学生。")
+
+    for student in students:
+        if assignment is None:
+            # 同步该学科下的所有作业：下载整个学科目录
+            remote_course_dir = f"{student}/{course}"
+            local_course_dir = WORKDIR / student / course
+            if not force and local_course_dir.exists() and any(local_course_dir.iterdir()):
+                print(f"  跳过 {student} 的 {course} 目录（已存在且非空）")
+                continue
+            print(f"同步 {student} 的 {course} 目录...")
+            download_zip(remote_course_dir, local_course_dir, force)
+        else:
+            # 只同步指定作业
+            remote_job_dir = f"{student}/{course}/{assignment}"
+            local_job_dir = WORKDIR / student / course / assignment
+            if not force and local_job_dir.exists() and any(local_job_dir.iterdir()):
+                print(f"  跳过 {student} 的 {course}/{assignment}（已存在且非空）")
+                continue
+            print(f"同步 {student} 的 {course}/{assignment}...")
+            download_zip(remote_job_dir, local_job_dir, force)
+
+    print("同步完成。")
+
+# ========== 以下为原有函数（打包、报告、创建、删除）保持不变 ==========
 def fetch_assignment(course: str, assignment: str, force=False):
-    """
-    确保本地 WORKDIR 中存在所有学生的该作业（若缺失则从网盘下载）
-    """
+    """确保本地 WORKDIR 中存在所有学生的该作业（若缺失则从网盘下载）"""
     if not WORKDIR:
         print("错误：未设置 WORKDIR 环境变量。")
         return None
@@ -397,13 +400,10 @@ def new_assignment(course: str, assignment: str):
 
     print(f"共 {len(students)} 个学生。")
     for student in students:
-        # 创建科目目录
         course_path = f"{student}/{course}"
         print(f"处理 {student}...")
         if not create_remote_dir(course_path):
-            # 如果科目目录已存在，仍继续创建作业目录
             pass
-        # 创建作业目录
         assignment_path = f"{course_path}/{assignment}"
         if create_remote_dir(assignment_path):
             print(f"  已创建: {assignment_path}")
@@ -420,11 +420,9 @@ def delete_assignment(course: str, assignment: str, yes=False):
         print("未找到任何学生文件夹。")
         return
 
-    # 构建待删除路径列表
     paths_to_delete = []
     for student in students:
         job_path = f"{student}/{course}/{assignment}"
-        # 检查是否存在（通过 HEAD 请求）
         url = f"{BASE_URL}/{job_path}"
         try:
             resp = session.head(url, timeout=5)
@@ -459,9 +457,11 @@ def main():
     parser = argparse.ArgumentParser(description="网盘作业管理工具")
     subparsers = parser.add_subparsers(dest='command', help='子命令')
 
-    # 全量同步模式
-    sync_parser = subparsers.add_parser('sync', help='全量同步网盘到本地')
+    # 全量同步模式（可选指定学科/作业）
+    sync_parser = subparsers.add_parser('sync', help='同步网盘到本地')
     sync_parser.add_argument('--force', '-f', action='store_true', help='强制覆盖已存在文件')
+    sync_parser.add_argument('-c', '--course', help='学科名称（可选，不填则全量同步）')
+    sync_parser.add_argument('-a', '--assignment', help='作业名称（可选，需与 -c 配合使用）')
 
     # 打包模式
     pack_parser = subparsers.add_parser('pack', help='打包指定作业')
@@ -488,7 +488,11 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'sync':
-        sync_all(force=args.force)
+        if args.course:
+            # 如果指定了学科，则同步该学科（若同时指定作业则只同步该作业）
+            sync_assignment(args.course, args.assignment, force=args.force)
+        else:
+            sync_all(force=args.force)
     elif args.command == 'pack':
         zip_assignment(args.course, args.assignment, Path(args.target_zip), args.force)
     elif args.command == 'report':
@@ -498,14 +502,14 @@ def main():
     elif args.command == 'delete':
         delete_assignment(args.course, args.assignment, yes=args.yes)
     else:
-        # 兼容旧版无子命令的调用（直接运行视为全量同步）
-        # 如果传入 -c -a -t 等，则走打包模式（保持向后兼容）
-        if hasattr(args, 'course') and args.course and args.assignment and args.target_zip:
-            zip_assignment(args.course, args.assignment, Path(args.target_zip), args.force)
+        # 兼容旧版无子命令的调用
+        if hasattr(args, 'course') and args.course:
+            # 如果传入了 -c，则视为同步学科/作业
+            sync_assignment(args.course, getattr(args, 'assignment', None), force=getattr(args, 'force', False))
         elif hasattr(args, 'report') and args.report:
             generate_report(Path(args.report))
         else:
-            sync_all(force=args.force if hasattr(args, 'force') else False)
+            sync_all(force=getattr(args, 'force', False))
 
 if __name__ == '__main__':
     main()

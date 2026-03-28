@@ -693,14 +693,30 @@ class App:
                     passwd=config['passwd']
                 )
             elif func == "删除作业文件夹":
-                stats = main.delete_assignment(
-                    course=params['course'],
-                    assignment=params['assignment'],
-                    yes=False,  # GUI中暂不强制确认，由用户自行确认，但这里我们直接传False，让函数内部弹出命令行确认，但这在GUI中不可见。更好的做法是弹窗确认。
-                    base_url=config['base_url'],
-                    user=config['user'],
-                    passwd=config['passwd']
-                )
+                # 在 GUI 中先通过弹窗确认
+                # 注意：由于这是在线程中，messagebox.askyesno 必须在主线程运行，因此需要特殊处理
+                # 我们使用一个同步等待的队列来实现跨线程交互
+                confirm_queue = []
+                def ask():
+                    result = messagebox.askyesno("确认删除", 
+                        f"确定要删除所有学生的 {params['course']}/{params['assignment']} 文件夹吗？\n此操作不可撤销！")
+                    confirm_queue.append(result)
+                self.root.after(0, ask)
+                # 等待用户响应（简单轮询）
+                while not confirm_queue:
+                    threading.Event().wait(0.1)
+                if confirm_queue[0]:
+                    stats = main.delete_assignment(
+                        course=params['course'],
+                        assignment=params['assignment'],
+                        yes=True,  # 用户已确认
+                        base_url=config['base_url'],
+                        user=config['user'],
+                        passwd=config['passwd']
+                    )
+                else:
+                    print("用户取消删除操作。")
+                    stats = {'cancelled': True, 'message': '用户取消'}
             elif func == "同步学科/作业":
                 stats = main.sync_assignment(
                     course=params['course'],

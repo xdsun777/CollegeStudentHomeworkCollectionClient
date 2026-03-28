@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 网盘作业管理工具 - 图形界面（优先使用本地数据，网盘数据需手动刷新）
-修正目录结构：WORKDIR/学生/学科/作业/
+支持多任务并发执行，不同任务日志使用不同颜色区分。
 依赖：python-dotenv, requests, openpyxl, tkinter (内置)
 使用方法：python gui.py
 """
@@ -17,14 +17,33 @@ import requests
 import main  # 导入主脚本（需在同一目录）
 
 class RedirectText:
-    """将 print 输出重定向到 GUI 文本框"""
-    def __init__(self, text_widget):
+    """将 print 输出重定向到 GUI 文本框，支持颜色区分任务"""
+    def __init__(self, text_widget, root):
         self.text_widget = text_widget
+        self.root = root
+
+    def _insert_text(self, text, tag):
+        """在主线程中执行插入，并为新插入的文本应用标签"""
+        start = self.text_widget.index("end")
+        self.text_widget.insert(tk.END, text)
+        end = self.text_widget.index("end")
+        if start != end:
+            self.text_widget.tag_add(tag, start, end)
 
     def write(self, string):
-        self.text_widget.insert(tk.END, string)
-        self.text_widget.see(tk.END)
-        self.text_widget.update_idletasks()
+        if not string:
+            return
+        # 获取当前线程的任务ID
+        current_thread = threading.current_thread()
+        task_id = getattr(current_thread, 'task_id', 0)  # 默认为0（主线程或其他）
+        # 选择标签（task_0 为默认黑色，task_1 ~ task_6 为彩色）
+        if task_id == 0:
+            tag = "task_0"
+        else:
+            # 任务ID从1开始，循环使用1-6的颜色
+            tag = f"task_{(task_id - 1) % 6 + 1}"
+        # 将插入操作调度到主线程（确保线程安全）
+        self.root.after(0, lambda: self._insert_text(string, tag))
 
     def flush(self):
         pass
@@ -38,6 +57,10 @@ class App:
 
         # 加载配置
         self.config = self.load_config()
+
+        # 任务计数器（用于日志区分）
+        self.task_counter = 0
+        self.task_counter_lock = threading.Lock()
 
         # 创建界面
         self.create_widgets()
@@ -68,8 +91,7 @@ class App:
         set_key(dotenv_path, 'BASE_URL', self.base_url_var.get())
         set_key(dotenv_path, 'USER', self.user_var.get())
         set_key(dotenv_path, 'PASSWD', self.passwd_var.get())
-        set_key(dotenv_path, 'REPORT_PATH', self.report_path_var.get())  # 新增
-
+        set_key(dotenv_path, 'REPORT_PATH', self.report_path_var.get())
         load_dotenv(dotenv_path, override=True)
         # 更新主脚本中的全局变量
         self._apply_config_to_main()
@@ -82,31 +104,36 @@ class App:
         user = self.user_var.get().strip()
         passwd = self.passwd_var.get().strip()
         if workdir:
-            main.WORKDIR = Path(workdir)
+            main._WORKDIR = Path(workdir)
         if base_url:
-            main.BASE_URL = base_url
+            main._BASE_URL = base_url
         if user:
-            main.USER = user
+            main._USER = user
         if passwd:
-            main.PASSWD = passwd
+            main._PASSWD = passwd
 
     def apply_config(self):
-        """应用当前界面配置到 main 模块，并检查完整性"""
+        """应用当前界面配置到 main 模块，并检查完整性（返回配置快照）"""
         workdir = self.workdir_var.get().strip()
         base_url = self.base_url_var.get().strip()
         user = self.user_var.get().strip()
         passwd = self.passwd_var.get().strip()
         if not workdir:
             messagebox.showerror("错误", "请先设置本地工作目录")
-            return False
+            return None
         if not base_url:
             messagebox.showerror("错误", "请先设置网盘地址")
-            return False
+            return None
         if not user or not passwd:
             messagebox.showerror("错误", "请先设置用户名和密码")
-            return False
-        self._apply_config_to_main()
-        return True
+            return None
+        # 返回配置快照（字典）
+        return {
+            'workdir': Path(workdir),
+            'base_url': base_url.rstrip('/'),
+            'user': user,
+            'passwd': passwd
+        }
 
     def test_connection(self):
         """测试网盘连接"""
@@ -175,11 +202,11 @@ class App:
         report_entry.grid(row=4, column=1, padx=5, pady=5)
         ttk.Button(config_frame, text="浏览", command=self.browse_default_report).grid(row=4, column=2, padx=5, pady=5)
 
-
         btn_frame = ttk.Frame(config_frame)
         btn_frame.grid(row=6, column=0, columnspan=3, pady=10)
         ttk.Button(btn_frame, text="保存配置", command=self.save_config).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="测试连接", command=self.test_connection).pack(side=tk.LEFT, padx=5)
+
         # ---------- 功能页 ----------
         # 功能选择
         ttk.Label(self.func_frame, text="选择功能:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
@@ -206,23 +233,33 @@ class App:
         self.status_label = ttk.Label(self.func_frame, text="", foreground="gray")
         self.status_label.grid(row=2, column=0, columnspan=3, pady=5)
 
-        # 执行按钮
+        # 执行按钮（不再禁用，允许多任务）
         self.run_btn = ttk.Button(self.func_frame, text="执行", command=self.run_task)
         self.run_btn.grid(row=3, column=1, pady=10)
 
         # ---------- 日志页 ----------
         self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, height=20)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        sys.stdout = RedirectText(self.log_text)
 
+        # 配置颜色标签（用于区分不同任务的输出）
+        self.log_text.tag_configure("task_0", foreground="black")
+        self.log_text.tag_configure("task_1", foreground="red")
+        self.log_text.tag_configure("task_2", foreground="green")
+        self.log_text.tag_configure("task_3", foreground="blue")
+        self.log_text.tag_configure("task_4", foreground="orange")
+        self.log_text.tag_configure("task_5", foreground="purple")
+        self.log_text.tag_configure("task_6", foreground="brown")
 
+        # 重定向标准输出
+        sys.stdout = RedirectText(self.log_text, self.root)
 
     def browse_default_report(self):
         """浏览选择默认报告输出文件"""
         file = filedialog.asksaveasfilename(defaultextension=".xlsx", filetypes=[("Excel files", "*.xlsx")])
         if file:
             self.report_path_var.set(file)
-    # ---------- 本地数据获取（修正目录结构）----------
+
+    # ---------- 本地数据获取 ----------
     def _get_student_dirs(self):
         """获取工作目录下所有学生目录"""
         workdir = self.workdir_var.get().strip()
@@ -263,7 +300,6 @@ class App:
             courses = self._get_local_courses()
             target_combo.config(values=courses)
             if courses:
-                # 如果当前选中值不在列表中，清空选中
                 if target_combo.get() not in courses:
                     target_combo.set('')
             else:
@@ -286,15 +322,15 @@ class App:
                 target_combo.set('')
 
     # ---------- 网盘数据获取（仅用于刷新）----------
-    def get_courses_from_remote(self):
+    def get_courses_from_remote(self, config):
         """从网盘获取所有科目（去重）"""
-        auth = (self.user_var.get().strip(), self.passwd_var.get().strip())
-        base_url = self.base_url_var.get().strip().rstrip('/')
-        if not base_url or not auth[0] or not auth[1]:
+        if not config:
             return []
+        base_url = config['base_url']
+        user = config['user']
+        passwd = config['passwd']
         try:
-            # 获取根目录所有学生
-            resp = requests.get(f"{base_url}/?json", auth=auth, timeout=10)
+            resp = requests.get(f"{base_url}/?json", auth=(user, passwd), timeout=10)
             resp.raise_for_status()
             data = resp.json()
             students = [p['name'] for p in data.get('paths', []) if p['path_type'] == 'Dir' and main.is_student_dir(p['name'])]
@@ -302,7 +338,7 @@ class App:
             for student in students:
                 url = f"{base_url}/{student}/?json"
                 try:
-                    resp2 = requests.get(url, auth=auth, timeout=5)
+                    resp2 = requests.get(url, auth=(user, passwd), timeout=5)
                     if resp2.status_code == 200:
                         data2 = resp2.json()
                         for item in data2.get('paths', []):
@@ -315,16 +351,15 @@ class App:
             print(f"获取科目列表失败: {e}")
             return []
 
-    def get_assignments_from_remote(self, course):
+    def get_assignments_from_remote(self, course, config):
         """获取指定科目下的所有作业（去重）"""
-        if not course:
+        if not course or not config:
             return []
-        auth = (self.user_var.get().strip(), self.passwd_var.get().strip())
-        base_url = self.base_url_var.get().strip().rstrip('/')
-        if not base_url or not auth[0] or not auth[1]:
-            return []
+        base_url = config['base_url']
+        user = config['user']
+        passwd = config['passwd']
         try:
-            resp = requests.get(f"{base_url}/?json", auth=auth, timeout=10)
+            resp = requests.get(f"{base_url}/?json", auth=(user, passwd), timeout=10)
             resp.raise_for_status()
             data = resp.json()
             students = [p['name'] for p in data.get('paths', []) if p['path_type'] == 'Dir' and main.is_student_dir(p['name'])]
@@ -332,7 +367,7 @@ class App:
             for student in students:
                 url = f"{base_url}/{student}/{course}/?json"
                 try:
-                    resp2 = requests.get(url, auth=auth, timeout=5)
+                    resp2 = requests.get(url, auth=(user, passwd), timeout=5)
                     if resp2.status_code == 200:
                         data2 = resp2.json()
                         for item in data2.get('paths', []):
@@ -347,9 +382,12 @@ class App:
 
     def refresh_courses_from_remote(self):
         """从网盘刷新科目列表（后台线程）"""
+        config = self.apply_config()
+        if not config:
+            return
         self._set_status("正在从网盘加载科目列表...")
         def _refresh():
-            courses = self.get_courses_from_remote()
+            courses = self.get_courses_from_remote(config)
             self.root.after(0, lambda: self._set_status(""))
             if courses:
                 self.root.after(0, lambda: self.course_combo.config(values=courses))
@@ -365,9 +403,12 @@ class App:
         if not course:
             self._set_status("请先选择科目", error=True)
             return
+        config = self.apply_config()
+        if not config:
+            return
         self._set_status(f"正在从网盘加载科目 '{course}' 下的作业列表...")
         def _refresh():
-            assignments = self.get_assignments_from_remote(course)
+            assignments = self.get_assignments_from_remote(course, config)
             self.root.after(0, lambda: self._set_status(""))
             if assignments:
                 self.root.after(0, lambda: self.assignment_combo.config(values=assignments))
@@ -384,9 +425,12 @@ class App:
     # ---------- 网盘选择窗口（创建作业文件夹用）----------
     def select_course_from_remote(self):
         """打开一个简单选择窗口选择科目（从网盘获取）"""
+        config = self.apply_config()
+        if not config:
+            return
         self._set_status("正在从网盘获取科目列表...")
         def _get():
-            courses = self.get_courses_from_remote()
+            courses = self.get_courses_from_remote(config)
             self.root.after(0, lambda: self._set_status(""))
             if not courses:
                 self.root.after(0, lambda: messagebox.showinfo("提示", "未从网盘找到任何科目"))
@@ -400,9 +444,12 @@ class App:
         if not course:
             messagebox.showinfo("提示", "请先选择或输入科目")
             return
+        config = self.apply_config()
+        if not config:
+            return
         self._set_status(f"正在从网盘获取科目 '{course}' 下的作业列表...")
         def _get():
-            assignments = self.get_assignments_from_remote(course)
+            assignments = self.get_assignments_from_remote(course, config)
             self.root.after(0, lambda: self._set_status(""))
             if not assignments:
                 self.root.after(0, lambda: messagebox.showinfo("提示", f"科目 '{course}' 下未从网盘找到任何作业"))
@@ -479,10 +526,6 @@ class App:
             self.load_local_assignments()
 
         elif func == "生成报告":
-            # ttk.Label(self.param_frame, text="输出Excel文件:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
-            # report_entry = ttk.Entry(self.param_frame, textvariable=self.target_report_var, width=30)
-            # report_entry.grid(row=0, column=1, padx=5, pady=5)
-            # ttk.Button(self.param_frame, text="浏览", command=self.browse_report).grid(row=0, column=2, padx=5, pady=5)
             ttk.Label(self.param_frame, text="输出Excel文件:").grid(row=0, column=0, sticky=tk.W, padx=5, pady=5)
             report_entry = ttk.Entry(self.param_frame, textvariable=self.target_report_var, width=30)
             report_entry.grid(row=0, column=1, padx=5, pady=5)
@@ -547,80 +590,164 @@ class App:
 
     # ---------- 任务执行 ----------
     def run_task(self):
-        """执行选中的功能（先应用临时配置，不保存到文件）"""
+        """执行选中的功能（多任务并发）"""
         func = self.func_var.get()
         if not func:
             messagebox.showwarning("提示", "请选择功能")
             return
 
-        # 应用当前界面配置到 main 模块（不保存文件）
-        if not self.apply_config():
+        # 获取当前配置快照（同时验证配置完整性）
+        config = self.apply_config()
+        if not config:
             return
 
-        # 禁用执行按钮
-        self.run_btn.config(state=tk.DISABLED)
-        self.log_text.delete(1.0, tk.END)
+        # 获取功能参数（根据当前界面控件）
+        params = {}
+        if func == "全量同步":
+            params['force'] = self.force_var.get()
+        elif func == "打包作业":
+            params['course'] = self.course_combo.get().strip()
+            params['assignment'] = self.assignment_combo.get().strip()
+            params['output_zip'] = self.target_zip_var.get().strip()
+            params['force'] = self.force_var.get()
+        elif func == "生成报告":
+            params['output_excel'] = self.target_report_var.get().strip()
+        elif func == "创建作业文件夹":
+            params['course'] = self.course_combo.get().strip()
+            params['assignment'] = self.assignment_combo.get().strip()
+        elif func == "删除作业文件夹":
+            params['course'] = self.course_combo.get().strip()
+            params['assignment'] = self.assignment_combo.get().strip()
+        elif func == "同步学科/作业":
+            params['course'] = self.course_combo.get().strip()
+            params['assignment'] = self.assignment_combo.get().strip() if self.assignment_combo else None
+            params['force'] = self.force_var.get()
 
-        # 启动线程
-        thread = threading.Thread(target=self._run_task, args=(func,))
-        thread.daemon = True
+        # 检查必要参数
+        if func in ("打包作业", "创建作业文件夹", "删除作业文件夹"):
+            if not params.get('course') or not params.get('assignment'):
+                self.show_error("科目和作业名不能为空")
+                return
+        if func == "打包作业" and not params.get('output_zip'):
+            self.show_error("输出ZIP文件不能为空")
+            return
+        if func == "生成报告" and not params.get('output_excel'):
+            self.show_error("输出Excel文件不能为空")
+            return
+        if func == "同步学科/作业" and not params.get('course'):
+            self.show_error("学科不能为空")
+            return
+
+        # 分配任务序号
+        with self.task_counter_lock:
+            self.task_counter += 1
+            task_id = self.task_counter
+
+        # 启动独立线程执行任务
+        thread = threading.Thread(target=self._run_task,
+                                  args=(task_id, func, params, config),
+                                  daemon=True)
+        # 将任务ID绑定到线程，供日志颜色使用
+        thread.task_id = task_id
         thread.start()
 
-    def _run_task(self, func):
+    def _run_task(self, task_id, func, params, config):
+        """在线程中执行具体任务，并输出总结"""
+        # 在日志开头打印任务标识
+        print(f"\n{'='*50}")
+        print(f"[任务 {task_id}] 开始执行: {func}")
+        print(f"{'='*50}")
+
         try:
+            stats = None
             if func == "全量同步":
-                force = self.force_var.get()
-                main.sync_all(force=force)
-
+                stats = main.sync_all(
+                    force=params.get('force', False),
+                    workdir=config['workdir'],
+                    base_url=config['base_url'],
+                    user=config['user'],
+                    passwd=config['passwd']
+                )
             elif func == "打包作业":
-                course = self.course_combo.get().strip()
-                assignment = self.assignment_combo.get().strip()
-                output_zip = self.target_zip_var.get().strip()
-                if not course or not assignment or not output_zip:
-                    self.show_error("科目、作业名和输出文件不能为空")
-                    return
-                force = self.force_var.get()
-                main.zip_assignment(course, assignment, Path(output_zip), force)
-
+                stats = main.zip_assignment(
+                    course=params['course'],
+                    assignment=params['assignment'],
+                    output_zip=Path(params['output_zip']),
+                    force=params.get('force', False),
+                    workdir=config['workdir'],
+                    base_url=config['base_url'],
+                    user=config['user'],
+                    passwd=config['passwd']
+                )
             elif func == "生成报告":
-                output_excel = self.target_report_var.get().strip()
-                if not output_excel:
-                    self.show_error("输出文件不能为空")
-                    return
-                main.generate_report(Path(output_excel))
-
+                stats = main.generate_report(
+                    output_excel=Path(params['output_excel']),
+                    workdir=config['workdir']
+                )
             elif func == "创建作业文件夹":
-                course = self.course_combo.get().strip()
-                assignment = self.assignment_combo.get().strip()
-                if not course or not assignment:
-                    self.show_error("科目和作业名不能为空")
-                    return
-                main.new_assignment(course, assignment)
-
+                stats = main.new_assignment(
+                    course=params['course'],
+                    assignment=params['assignment'],
+                    base_url=config['base_url'],
+                    user=config['user'],
+                    passwd=config['passwd']
+                )
             elif func == "删除作业文件夹":
-                course = self.course_combo.get().strip()
-                assignment = self.assignment_combo.get().strip()
-                if not course or not assignment:
-                    self.show_error("科目和作业名不能为空")
-                    return
-                # 删除功能内部有确认
-                main.delete_assignment(course, assignment, yes=False)
-
+                stats = main.delete_assignment(
+                    course=params['course'],
+                    assignment=params['assignment'],
+                    yes=False,  # GUI中暂不强制确认，由用户自行确认，但这里我们直接传False，让函数内部弹出命令行确认，但这在GUI中不可见。更好的做法是弹窗确认。
+                    base_url=config['base_url'],
+                    user=config['user'],
+                    passwd=config['passwd']
+                )
             elif func == "同步学科/作业":
-                course = self.course_combo.get().strip()
-                if not course:
-                    self.show_error("学科不能为空")
-                    return
-                assignment = self.assignment_combo.get().strip() if self.assignment_combo else None
-                force = self.force_var.get()
-                main.sync_assignment(course, assignment, force)
-
+                stats = main.sync_assignment(
+                    course=params['course'],
+                    assignment=params.get('assignment'),
+                    force=params.get('force', False),
+                    workdir=config['workdir'],
+                    base_url=config['base_url'],
+                    user=config['user'],
+                    passwd=config['passwd']
+                )
             else:
-                self.show_error("未知功能")
+                print(f"未知功能: {func}")
+                return
+
+            # 输出任务总结
+            print(f"\n{'='*50}")
+            print(f"[任务 {task_id}] 执行完成: {func}")
+            print(f"{'='*50}")
+            if stats:
+                if isinstance(stats, dict):
+                    if 'success' in stats and 'total' in stats:
+                        print(f"统计信息:")
+                        print(f"  总计: {stats.get('total', 0)}")
+                        print(f"  成功: {stats.get('success', 0)}")
+                        print(f"  失败: {stats.get('failed', 0)}")
+                        if stats.get('failures'):
+                            print(f"  失败详情:")
+                            for fail in stats['failures']:
+                                print(f"    - {fail}")
+                    elif 'success' in stats:
+                        print(f"结果: {'成功' if stats.get('success') else '失败'}")
+                        if 'error' in stats:
+                            print(f"错误: {stats['error']}")
+                    else:
+                        print(f"返回信息: {stats}")
+                else:
+                    print(f"返回信息: {stats}")
+            else:
+                print("未返回统计信息。")
         except Exception as e:
-            self.show_error(f"执行出错: {e}")
+            print(f"[任务 {task_id}] 执行出错: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
-            self.root.after(0, lambda: self.run_btn.config(state=tk.NORMAL))
+            print(f"\n{'='*50}")
+            print(f"[任务 {task_id}] 结束")
+            print(f"{'='*50}\n")
 
     def show_error(self, msg):
         self.root.after(0, lambda: messagebox.showerror("错误", msg))

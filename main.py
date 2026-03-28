@@ -11,13 +11,16 @@
 
 import os
 import sys
+import shutil
 import argparse
 import requests
 import zipfile
 import re
+import base64
 from io import BytesIO
 from pathlib import Path
 from dotenv import load_dotenv
+from urllib.parse import quote
 
 load_dotenv()
 
@@ -27,7 +30,17 @@ USER = os.getenv('USER', '')
 PASSWD = os.getenv('PASSWD', '')
 
 session = requests.Session()
-session.auth = (USER, PASSWD)
+# session.auth = (USER, PASSWD)
+auth_str = f"{USER}:{PASSWD}"
+auth_bytes = auth_str.encode('utf-8')
+auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+session.headers.update({'Authorization': f'Basic {auth_b64}'})
+
+def encode_path(path: str) -> str:
+    """对路径进行URL编码，保留斜杠"""
+    if not path:
+        return ''
+    return '/'.join(quote(part, safe='') for part in path.split('/'))
 
 def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
@@ -36,7 +49,7 @@ def is_student_dir(name: str) -> bool:
     return bool(re.match(r'^\d+-\w+$', name))
 
 def list_remote_dir(remote_path: str):
-    url = f"{BASE_URL}/{remote_path}".rstrip('/') + '/?json'
+    url = f"{BASE_URL}/{encode_path(remote_path)}".rstrip('/') + '/?json'
     try:
         resp = session.get(url, timeout=10)
         resp.raise_for_status()
@@ -55,7 +68,7 @@ def list_remote_dir(remote_path: str):
         return []
 
 def create_remote_dir(remote_path: str):
-    url = f"{BASE_URL}/{remote_path}"
+    url = f"{BASE_URL}/{encode_path(remote_path)}"
     try:
         resp = session.request('MKCOL', url, timeout=10)
         if resp.status_code in (200, 201):
@@ -70,7 +83,7 @@ def create_remote_dir(remote_path: str):
         return False
 
 def delete_remote(remote_path: str):
-    url = f"{BASE_URL}/{remote_path}"
+    url = f"{BASE_URL}/{encode_path(remote_path)}"
     try:
         resp = session.delete(url, timeout=10)
         if resp.status_code in (200, 204):
@@ -95,7 +108,7 @@ def download_file(remote_path: str, local_path: Path, force=False):
         except:
             pass
 
-    url = f"{BASE_URL}/{remote_path}"
+    url = f"{BASE_URL}/{encode_path(remote_path)}"
     try:
         print(f"  下载: {url} -> {local_path}")
         resp = session.get(url, stream=True, timeout=30)
@@ -107,6 +120,48 @@ def download_file(remote_path: str, local_path: Path, force=False):
                     f.write(chunk)
     except Exception as e:
         print(f"  下载失败 {remote_path}: {e}")
+
+# def download_zip(remote_dir: str, local_dir: Path, force=False):
+#     if not force and local_dir.exists() and any(local_dir.iterdir()):
+#         print(f"  本地目录已存在且非空，跳过：{local_dir}")
+#         return
+
+#     url = f"{BASE_URL}/{remote_dir}?zip"
+#     try:
+#         print(f"  下载并解压: {url} -> {local_dir}")
+#         resp = session.get(url, timeout=30)
+#         resp.raise_for_status()
+#         ensure_dir(local_dir)
+#         with zipfile.ZipFile(BytesIO(resp.content)) as zf:
+#             import tempfile
+#             with tempfile.TemporaryDirectory() as tmpdir:
+#                 tmp_path = Path(tmpdir)
+#                 zf.extractall(tmp_path)
+#                 extracted = list(tmp_path.iterdir())
+#                 if len(extracted) == 1 and extracted[0].is_dir():
+#                     subdir = extracted[0]
+#                     for item in subdir.iterdir():
+#                         dest = local_dir / item.name
+#                         if dest.exists() and force:
+#                             if dest.is_dir():
+#                                 import shutil
+#                                 shutil.rmtree(dest)
+#                             else:
+#                                 dest.unlink()
+#                         item.rename(dest)
+#                 else:
+#                     for item in extracted:
+#                         dest = local_dir / item.name
+#                         if dest.exists() and force:
+#                             if dest.is_dir():
+#                                 import shutil
+#                                 shutil.rmtree(dest)
+#                             else:
+#                                 dest.unlink()
+#                         item.rename(dest)
+#     except Exception as e:
+#         print(f"  下载失败 {remote_dir}: {e}")
+
 
 def download_zip(remote_dir: str, local_dir: Path, force=False):
     if not force and local_dir.exists() and any(local_dir.iterdir()):
@@ -131,23 +186,22 @@ def download_zip(remote_dir: str, local_dir: Path, force=False):
                         dest = local_dir / item.name
                         if dest.exists() and force:
                             if dest.is_dir():
-                                import shutil
                                 shutil.rmtree(dest)
                             else:
                                 dest.unlink()
-                        item.rename(dest)
+                        shutil.move(item, dest)
                 else:
                     for item in extracted:
                         dest = local_dir / item.name
                         if dest.exists() and force:
                             if dest.is_dir():
-                                import shutil
                                 shutil.rmtree(dest)
                             else:
                                 dest.unlink()
-                        item.rename(dest)
+                        shutil.move(item, dest)
     except Exception as e:
         print(f"  下载失败 {remote_dir}: {e}")
+
 
 def sync_all(force=False):
     if not WORKDIR:
